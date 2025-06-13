@@ -29,6 +29,10 @@ import albumentations as A
 from torch.utils.tensorboard import SummaryWriter
 import tempfile
 from typing import Dict, List, Optional, Tuple, Union
+import math
+import torch.nn.functional as F
+from collections import defaultdict
+from typing import Any
 
 # --- Configuration ---
 DATA_PATH = 'data/'
@@ -1013,6 +1017,7 @@ if __name__ == "__main__":
     with torch.no_grad():
         cnn_output_size = temp_cnn(dummy_cnn_input).shape[-1]
     del temp_cnn, dummy_cnn_input 
+ 
     print(f"Determined CNN flattened output size: {cnn_output_size}")
 
     for future_interval_steps in N_FUTURE_TIMESTEPS:
@@ -1072,389 +1077,34 @@ if __name__ == "__main__":
     print(summary_df)
     summary_df.to_csv(os.path.join(RESULTS_PATH, 'r2_score_summary.csv'))
 
-    print(f"\nPyTorch Models saved in: {MODEL_SAVE_PATH}")
-    print(f"PyTorch Results (plots, summary) saved in: {RESULTS_PATH}")
-    print("PyTorch Script finished.")
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('cloud_coverage.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# Suppress specific warnings
-warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.functional')
-
-class CloudCoverageConfig:
-    """Configuration class for cloud coverage prediction model."""
-    def __init__(self, **kwargs):
-        # Data configuration
-        self.data_path = kwargs.get('data_path', 'data/')
-        self.metadata_file = kwargs.get('metadata_file', 'image_metadata.csv')
-        self.img_height = kwargs.get('img_height', 128)
-        self.img_width = kwargs.get('img_width', 128)
-        
-        # Model configuration
-        self.model_type = kwargs.get('model_type', 'LSTM')
-        self.n_past_timesteps = kwargs.get('n_past_timesteps', 16)
-        self.n_future_timesteps = kwargs.get('n_future_timesteps', [1, 2, 3])
-        self.cnn_channels = kwargs.get('cnn_channels', [32, 64, 128])
-        self.lstm_hidden_size = kwargs.get('lstm_hidden_size', 128)
-        self.dropout_rate = kwargs.get('dropout_rate', 0.2)
-        
-        # Training configuration
-        self.batch_size = kwargs.get('batch_size', 64)
-        self.epochs = kwargs.get('epochs', 100)
-        self.learning_rate = kwargs.get('learning_rate', 0.001)
-        self.early_stopping_patience = kwargs.get('early_stopping_patience', 15)
-        self.lr_patience = kwargs.get('lr_patience', 5)
-        self.train_val_test_split = kwargs.get('train_val_test_split', [0.7, 0.15, 0.15])
-        
-        # Augmentation configuration
-        self.use_augmentation = kwargs.get('use_augmentation', True)
-        self.augmentation_prob = kwargs.get('augmentation_prob', 0.5)
-        
-        # Paths configuration
-        self.model_save_path = kwargs.get('model_save_path', 'models_pytorch/')
-        self.results_path = kwargs.get('results_path', 'results_pytorch/')
-        self.plots_path = Path(self.results_path) / 'plots'
-        self.metrics_path = Path(self.results_path) / 'metrics'
-        
-        # Create necessary directories
-        for path in [self.model_save_path, self.results_path, self.plots_path, self.metrics_path]:
-            Path(path).mkdir(parents=True, exist_ok=True)
-        
-        # Validate configuration
-        self._validate_config()
-    
-    def _validate_config(self):
-        """Validate configuration parameters."""
-        assert sum(self.train_val_test_split) == 1.0, "Split ratios must sum to 1.0"
-        assert all(x > 0 for x in self.train_val_test_split), "Split ratios must be positive"
-        assert self.batch_size > 0, "Batch size must be positive"
-        assert self.epochs > 0, "Number of epochs must be positive"
-        assert self.learning_rate > 0, "Learning rate must be positive"
-        assert len(self.n_future_timesteps) > 0, "Must predict at least one future timestep"
-    
-    def save(self, path: str):
-        """Save configuration to JSON file."""
-        with open(path, 'w') as f:
-            json.dump(self.__dict__, f, indent=4)
-    
-    @classmethod
-    def load(cls, path: str) -> 'CloudCoverageConfig':
-        """Load configuration from JSON file."""
-        with open(path, 'r') as f:
-            config_dict = json.load(f)
-        return cls(**config_dict)
-
-class ImageAugmentor:
-    """Handles image augmentation for cloud coverage prediction."""
-    def __init__(self, config: CloudCoverageConfig):
-        self.config = config
-        self.transform = A.Compose([
-            A.RandomBrightnessContrast(p=config.augmentation_prob),
-            A.GaussNoise(p=config.augmentation_prob),
-            A.GaussianBlur(p=config.augmentation_prob),
-            A.GridDistortion(p=config.augmentation_prob/2),
-            A.RandomRotate90(p=config.augmentation_prob),
-            A.HorizontalFlip(p=config.augmentation_prob),
-            A.VerticalFlip(p=config.augmentation_prob)
-        ])
-    
-    def __call__(self, image: np.ndarray) -> np.ndarray:
-        """Apply augmentation to image."""
-        if not self.config.use_augmentation:
-            return image
-        
-        # Ensure correct input format for albumentations
-        if len(image.shape) == 3 and image.shape[-1] == 1:
-            image = image.squeeze(-1)
-        
-        # Apply transformation
-        augmented = self.transform(image=image)
-        result = augmented['image']
-        
-        # Restore channel dimension if needed
-        if len(result.shape) == 2:
-            result = np.expand_dims(result, axis=-1)
-        
-        return result.astype(np.float32)
-
-class MetricsTracker:
-    """Tracks and logs model metrics during training."""
-    def __init__(self, config: CloudCoverageConfig, model_name: str):
-        self.config = config
-        self.model_name = model_name
-        self.writer = SummaryWriter(log_dir=f'runs/{model_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
-        self.metrics_history = defaultdict(list)
-        
-        # Initialize wandb if available
-        try:
-            wandb.init(project="cloud_coverage_prediction", name=model_name)
-            self.use_wandb = True
-        except Exception as e:
-            logger.warning(f"Could not initialize wandb: {e}")
-            self.use_wandb = False
-    
-    def update(self, metrics: Dict[str, float], step: int, phase: str = 'train'):
-        """Update metrics for given step and phase."""
-        # Log to tensorboard
-        for name, value in metrics.items():
-            self.writer.add_scalar(f'{phase}/{name}', value, step)
-            self.metrics_history[f'{phase}_{name}'].append(value)
-        
-        # Log to wandb
-        if self.use_wandb:
-            wandb.log({f'{phase}_{k}': v for k, v in metrics.items()}, step=step)
-    
-    def plot_metrics(self):
-        """Plot training metrics."""
-        metrics_plot_path = self.config.plots_path / f'{self.model_name}_metrics.png'
-        plt.figure(figsize=(15, 10))
-        
-        # Plot each metric
-        num_metrics = len(self.metrics_history) // 2  # Divide by 2 for train/val
-        for idx, (name, values) in enumerate(self.metrics_history.items()):
-            if 'train' in name:
-                plt.subplot(num_metrics, 1, idx//2 + 1)
-                plt.plot(values, label=f'Train {name.split("_")[-1]}')
-                plt.plot(self.metrics_history[name.replace('train', 'val')], 
-                        label=f'Val {name.split("_")[-1]}')
-                plt.title(name.split("_")[-1])
-                plt.legend()
-                plt.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(metrics_plot_path)
-        plt.close()
-    
-    def save_metrics(self):
-        """Save metrics to JSON file."""
-        metrics_file = self.config.metrics_path / f'{self.model_name}_metrics.json'
-        with open(metrics_file, 'w') as f:
-            json.dump(self.metrics_history, f, indent=4)
-    
-    def print_current_metrics(self, epoch: int, phase: str = 'train'):
-        """Print current metrics in a formatted table."""
-        table = PrettyTable()
-        table.field_names = ["Metric", "Value"]
-        
-        for name, values in self.metrics_history.items():
-            if phase in name and values:  # Check if we have values
-                table.add_row([name.split('_')[-1], f"{values[-1]:.4f}"])
-        
-        print(f"\nEpoch {epoch} - {phase.capitalize()} Metrics:")
-        print(table)
-    
-    def close(self):
-        """Cleanup resources."""
-        self.writer.close()
-        if self.use_wandb:
-            wandb.finish()
-
-def train_epoch(
-    model: nn.Module,
-    train_loader: DataLoader,
-    criterion: nn.Module,
-    optimizer: optim.Optimizer,
-    config: CloudCoverageConfig,
-    device: torch.device,
-    scaler_y: Optional[MinMaxScaler] = None
-) -> Dict[str, float]:
-    """Train model for one epoch."""
-    model.train()
-    total_loss = 0
-    all_targets = []
-    all_predictions = []
-    
-    with tqdm(train_loader, desc="Training") as pbar:
-        for batch_X, batch_y in pbar:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            
-            optimizer.zero_grad()
-            
-            # Forward pass (handle both attention and non-attention models)
-            if isinstance(model, ImprovedLSTMModel):
-                predictions, _ = model(batch_X)
-            else:
-                predictions = model(batch_X)
-            
-            # Calculate loss
-            loss = criterion(predictions, batch_y)
-            
-            # Backward pass
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            
-            # Update metrics
-            total_loss += loss.item() * batch_X.size(0)
-            
-            # Store predictions and targets for metrics
-            if scaler_y:
-                predictions = scaler_y.inverse_transform(predictions.detach().cpu().numpy())
-                batch_y = scaler_y.inverse_transform(batch_y.cpu().numpy())
-            else:
-                predictions = predictions.detach().cpu().numpy()
-                batch_y = batch_y.cpu().numpy()
-            
-            all_predictions.extend(predictions)
-            all_targets.extend(batch_y)
-            
-            # Update progress bar
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
-    # Calculate metrics
-    all_predictions = np.array(all_predictions)
-    all_targets = np.array(all_targets)
-    avg_loss = total_loss / len(train_loader.dataset)
-    r2 = r2_score(all_targets, all_predictions)
-    rmse = np.sqrt(mean_squared_error(all_targets, all_predictions))
-    mae = mean_absolute_error(all_targets, all_predictions)
-    
-    return {
-        'loss': avg_loss,
-        'r2': r2,
-        'rmse': rmse,
-        'mae': mae,
-        'predictions': all_predictions,
-        'targets': all_targets
-    }
-
-def validate(
-    model: nn.Module,
-    val_loader: DataLoader,
-    criterion: nn.Module,
-    config: CloudCoverageConfig,
-    device: torch.device,
-    scaler_y: Optional[MinMaxScaler] = None
-) -> Dict[str, float]:
-    """Validate the model."""
-    model.eval()
-    total_loss = 0
-    all_targets = []
-    all_predictions = []
-    all_attention_weights = []
-    
-    with torch.no_grad():
-        with tqdm(val_loader, desc="Validation") as pbar:
-            for batch_X, batch_y in pbar:
-                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-                
-                # Forward pass
-                if isinstance(model, ImprovedLSTMModel):
-                    predictions, attention_weights = model(batch_X)
-                    all_attention_weights.append(attention_weights.cpu().numpy())
-                else:
-                    predictions = model(batch_X)
-                
-                # Calculate loss
-                loss = criterion(predictions, batch_y)
-                total_loss += loss.item() * batch_X.size(0)
-                
-                # Store predictions and targets
-                if scaler_y:
-                    predictions = scaler_y.inverse_transform(predictions.cpu().numpy())
-                    batch_y = scaler_y.inverse_transform(batch_y.cpu().numpy())
-                else:
-                    predictions = predictions.cpu().numpy()
-                    batch_y = batch_y.cpu().numpy()
-                
-                all_predictions.extend(predictions)
-                all_targets.extend(batch_y)
-                
-                pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
-    
-    # Calculate metrics
-    all_predictions = np.array(all_predictions)
-    all_targets = np.array(all_targets)
-    avg_loss = total_loss / len(val_loader.dataset)
-    r2 = r2_score(all_targets, all_predictions)
-    rmse = np.sqrt(mean_squared_error(all_targets, all_predictions))
-    mae = mean_absolute_error(all_targets, all_predictions)
-    
-    results = {
-        'loss': avg_loss,
-        'r2': r2,
-        'rmse': rmse,
-        'mae': mae,
-        'predictions': all_predictions,
-        'targets': all_targets
-    }
-    
-    if all_attention_weights:
-        results['attention_weights'] = np.concatenate(all_attention_weights, axis=0)
-    
-    return results
-
-def save_model_checkpoint(
-    model: nn.Module,
-    optimizer: optim.Optimizer,
-    scheduler: Any,
-    epoch: int,
-    metrics: Dict[str, float],
-    config: CloudCoverageConfig,
-    model_name: str
-) -> str:
-    """Save model checkpoint."""
-    checkpoint_path = Path(config.model_save_path) / f'{model_name}_checkpoint.pt'
-    
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-        'metrics': metrics,
-        'config': config.__dict__
-    }
-    
-    torch.save(checkpoint, checkpoint_path)
-    logger.info(f"Saved checkpoint to {checkpoint_path}")
-    return str(checkpoint_path)
-
-def load_model_checkpoint(
-    model: nn.Module,
-    optimizer: optim.Optimizer,
-    scheduler: Any,
-    checkpoint_path: str
-) -> Tuple[nn.Module, optim.Optimizer, Any, int, Dict[str, float]]:
-    """Load model checkpoint."""
-    checkpoint = torch.load(checkpoint_path)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    if scheduler and checkpoint['scheduler_state_dict']:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    return model, optimizer, scheduler, checkpoint['epoch'], checkpoint['metrics']
-
-def plot_attention_weights(
-    attention_weights: np.ndarray,
-    config: CloudCoverageConfig,
-    model_name: str,
-    sample_idx: int = 0
-):
-    """Plot attention weights for visualization."""
-    plt.figure(figsize=(10, 6))
-    sns.heatmap(
-        attention_weights[sample_idx].squeeze(),
-        cmap='viridis',
-        xticklabels=range(1, config.n_past_timesteps + 1),
-        yticklabels=['Attention']
+    # Save final summary
+    summary_df = pd.DataFrame.from_dict(
+        {(i,j): results_summary[i][j] 
+         for i in results_summary.keys() 
+         for j in results_summary[i].keys()},
+        orient='index'
     )
-    plt.title(f'Attention Weights - {model_name}')
-    plt.xlabel('Time Step')
     
-    plot_path = config.plots_path / f'{model_name}_attention.png'
-    plt.savefig(plot_path)
-    plt.close()
-
+    summary_path = os.path.join(config.results_path, 'final_results_summary.csv')
+    summary_df.to_csv(summary_path)
+    logger.info(f"\nFinal results summary saved to: {summary_path}")
+    
+    # Print final summary table
+    table = PrettyTable()
+    table.field_names = ["Model", "Prediction Horizon", "R²", "RMSE", "MAE"]
+    
+    for model_name in results_summary:
+        for horizon in results_summary[model_name]:
+            metrics = results_summary[model_name][horizon]
+            table.add_row([
+                model_name,
+                horizon,
+                f"{metrics['test_r2']:.4f}",
+                f"{metrics['test_rmse']:.4f}",
+                f"{metrics['test_mae']:.4f}"
+            ])
+    
+    print("\nFinal Results Summary:")
+    print(table)
+    
+    logger.info("Cloud coverage prediction training completed successfully")
