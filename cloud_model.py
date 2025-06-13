@@ -4,19 +4,35 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
 import cv2
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime
 import rasterio
 from glob import glob
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 import json
 from pathlib import Path
+import logging
+import sys
+import warnings
+import math
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple, Union, Any
+import tempfile
+
+import wandb
+from prettytable import PrettyTable
+from tqdm import tqdm
+import albumentations as A
 import logging
 import sys
 from datetime import datetime
@@ -862,6 +878,103 @@ def split_data(X, y):
     )
     
     return X_train, X_val, X_test, y_train, y_val, y_test
+
+# --- Logging and Configuration Class ---
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('cloud_coverage.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Suppress specific warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.functional')
+
+class CloudCoverageConfig:
+    """Configuration class for cloud coverage prediction model."""
+    def __init__(self, **kwargs):
+        # Data configuration
+        self.data_path = kwargs.get('data_path', 'data/')
+        self.metadata_file = kwargs.get('metadata_file', 'image_metadata.csv')
+        self.img_height = kwargs.get('img_height', 128)
+        self.img_width = kwargs.get('img_width', 128)
+        
+        # Model configuration
+        self.model_type = kwargs.get('model_type', 'LSTM')
+        self.n_past_timesteps = kwargs.get('n_past_timesteps', 16)
+        self.n_future_timesteps = kwargs.get('n_future_timesteps', [1, 2, 3])
+        self.cnn_channels = kwargs.get('cnn_channels', [32, 64, 128])
+        self.lstm_hidden_size = kwargs.get('lstm_hidden_size', 128)
+        self.dropout_rate = kwargs.get('dropout_rate', 0.2)
+        
+        # Training configuration
+        self.batch_size = kwargs.get('batch_size', 64)
+        self.epochs = kwargs.get('epochs', 100)
+        self.learning_rate = kwargs.get('learning_rate', 0.001)
+        self.early_stopping_patience = kwargs.get('early_stopping_patience', 15)
+        self.lr_patience = kwargs.get('lr_patience', 5)
+        self.train_val_test_split = kwargs.get('train_val_test_split', [0.7, 0.15, 0.15])
+        
+        # Augmentation configuration
+        self.use_augmentation = kwargs.get('use_augmentation', True)
+        self.augmentation_prob = kwargs.get('augmentation_prob', 0.5)
+        
+        # Paths configuration
+        self.model_save_path = kwargs.get('model_save_path', 'models_pytorch/')
+        self.results_path = kwargs.get('results_path', 'results_pytorch/')
+        self.plots_path = Path(self.results_path) / 'plots'
+        self.metrics_path = Path(self.results_path) / 'metrics'
+        
+        # Create necessary directories
+        for path in [self.model_save_path, self.results_path, self.plots_path, self.metrics_path]:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        
+        # Validate configuration
+        self._validate_config()
+    
+    def _validate_config(self):
+        """Validate configuration parameters."""
+        assert sum(self.train_val_test_split) == 1.0, "Split ratios must sum to 1.0"
+        assert all(x > 0 for x in self.train_val_test_split), "Split ratios must be positive"
+        assert self.batch_size > 0, "Batch size must be positive"
+        assert self.epochs > 0, "Number of epochs must be positive"
+        assert self.learning_rate > 0, "Learning rate must be positive"
+        assert len(self.n_future_timesteps) > 0, "Must predict at least one future timestep"
+    
+    def save(self, path: str):
+        """Save configuration to JSON file."""
+        with open(path, 'w') as f:
+            json.dump(self.__dict__, f, indent=4)
+    
+    @classmethod
+    def load(cls, path: str) -> 'CloudCoverageConfig':
+        """Load configuration from JSON file."""
+        with open(path, 'r') as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)
+
+# Create global config instance
+config = CloudCoverageConfig(
+    data_path=DATA_PATH,
+    metadata_file=METADATA_FILE,
+    img_height=IMG_HEIGHT,
+    img_width=IMG_WIDTH,
+    n_past_timesteps=N_PAST_TIMESTEPS,
+    n_future_timesteps=N_FUTURE_TIMESTEPS,
+    batch_size=BATCH_SIZE,
+    epochs=EPOCHS,
+    learning_rate=LEARNING_RATE,
+    early_stopping_patience=EARLY_STOPPING_PATIENCE,
+    lr_patience=LR_PATIENCE,
+    train_val_test_split=TRAIN_VAL_TEST_SPLIT,
+    model_save_path=MODEL_SAVE_PATH,
+    results_path=RESULTS_PATH
+)
 
 # --- Main Script ---
 if __name__ == "__main__":
