@@ -7,27 +7,52 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import r2_score
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import cv2
 import matplotlib.pyplot as plt
-import rasterio # Added for TIF file support
-from glob import glob # For finding files in a directory
+import seaborn as sns
+from datetime import datetime
+import rasterio
+from glob import glob
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import json
+from pathlib import Path
+import logging
+import sys
+from datetime import datetime
+from pathlib import Path
+import warnings
+import wandb
+from prettytable import PrettyTable
+from tqdm import tqdm
+import albumentations as A
+from torch.utils.tensorboard import SummaryWriter
+import tempfile
+from typing import Dict, List, Optional, Tuple, Union
 
 # --- Configuration ---
-DATA_PATH = 'data/' # Base path to your dataset
-# IMAGE_DIR is now implicitly handled by cloudpath, but we might need a root for dummy data.
-# For real data, cloudpath in the CSV will be relative to DATA_PATH.
-# Example: if cloudpath is 'train_features/adwp', full path is 'data/train_features/adwp'
-METADATA_FILE = os.path.join(DATA_PATH, 'image_metadata.csv') # UPDATED: CSV with chip_id, location, datetime, cloudpath
+DATA_PATH = 'data/'
+METADATA_FILE = os.path.join(DATA_PATH, 'image_metadata.csv')
 MODEL_SAVE_PATH = 'models_pytorch/'
 RESULTS_PATH = 'results_pytorch/'
+PLOTS_PATH = os.path.join(RESULTS_PATH, 'plots')
+METRICS_PATH = os.path.join(RESULTS_PATH, 'metrics')
+
+# Model parameters
 IMG_HEIGHT = 128
 IMG_WIDTH = 128
-N_PAST_TIMESTEPS = 6 * 4 # 6 hours of data, assuming 15-min intervals (6 * 4 = 24)
-N_FUTURE_TIMESTEPS = [1, 2, 3] # Predicting for 15, 30, 45 mins
-EPOCHS = 20 # UPDATED: Increased for more thorough training
-BATCH_SIZE = 32
+N_PAST_TIMESTEPS = 16  # 4 hours of data, assuming 15-min intervals
+N_FUTURE_TIMESTEPS = [1, 2, 3]  # 15, 30, 45 mins prediction
+EPOCHS = 100  # Increased for thorough training
+BATCH_SIZE = 64  # Increased for faster training
 LEARNING_RATE = 0.001
+EARLY_STOPPING_PATIENCE = 15
+LR_PATIENCE = 5
+TRAIN_VAL_TEST_SPLIT = [0.7, 0.15, 0.15]  # Train/Val/Test split ratios
+
+# Create all necessary directories
+for path in [MODEL_SAVE_PATH, RESULTS_PATH, PLOTS_PATH, METRICS_PATH]:
+    os.makedirs(path, exist_ok=True)
 
 # --- Device Configuration ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,25 +119,58 @@ def load_and_preprocess_tif_image(folder_path_str):
 def calculate_cloud_coverage_from_image(image_array):
     """
     Calculates cloud coverage percentage from a preprocessed image array.
-    image_array is expected to be (H, W, C).
+    image_array is expected to be (H, W, C) with values normalized to [0,1].
     
-    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-    CRITICAL PLACEHOLDER: You MUST implement the logic to determine cloud 
-    coverage from your image data. This current function returns a dummy value.
-    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+    The function uses a combination of thresholding techniques to identify clouds:
+    1. Brightness threshold: Clouds are typically brighter than other features
+    2. Local contrast: Clouds often have higher local contrast
+    3. Texture analysis: Using local standard deviation
     """
-    # Example: if image_array is single channel, normalized [0,1]
-    # A very naive example: thresholding. This is LIKELY NOT ACCURATE for real data.
-    # if image_array is not None and image_array.size > 0:
-    #     # Assuming brighter pixels (e.g., > 0.7) are clouds. This is a wild guess.
-    #     cloudy_pixels = np.sum(image_array > 0.7)
-    #     total_pixels = image_array.shape[0] * image_array.shape[1]
-    #     coverage = (cloudy_pixels / total_pixels) * 100
-    #     # print(f"Calculated dummy coverage: {coverage:.2f}%") # For debugging
-    #     return coverage
+    if image_array is None or image_array.size == 0:
+        print("Warning: Empty or None image array provided")
+        return 0.0
     
-    print("WARNING: `calculate_cloud_coverage_from_image` is using a placeholder. Implement actual logic!")
-    return np.random.rand() * 100 # Returns a random percentage as a dummy
+    # Remove channel dimension if present
+    if len(image_array.shape) == 3:
+        image_array = image_array[..., 0]
+    
+    try:
+        # 1. Brightness-based cloud detection
+        brightness_threshold = 0.75  # Assuming normalized [0,1] values
+        bright_pixels = image_array > brightness_threshold
+        
+        # 2. Local contrast analysis
+        kernel_size = 3
+        kernel = np.ones((kernel_size, kernel_size)) / (kernel_size * kernel_size)
+        local_mean = cv2.filter2D(image_array, -1, kernel)
+        local_contrast = np.abs(image_array - local_mean)
+        contrast_threshold = 0.1  # Adjust based on your data
+        high_contrast = local_contrast > contrast_threshold
+        
+        # 3. Texture analysis using local standard deviation
+        local_std = np.zeros_like(image_array)
+        padding = kernel_size // 2
+        padded_img = np.pad(image_array, padding, mode='reflect')
+        for i in range(padding, padded_img.shape[0] - padding):
+            for j in range(padding, padded_img.shape[1] - padding):
+                window = padded_img[i-padding:i+padding+1, j-padding:j+padding+1]
+                local_std[i-padding, j-padding] = np.std(window)
+        texture_threshold = 0.05  # Adjust based on your data
+        textured_regions = local_std > texture_threshold
+        
+        # Combine all features
+        cloud_pixels = bright_pixels & (high_contrast | textured_regions)
+        
+        # Calculate coverage percentage
+        total_pixels = image_array.size
+        cloudy_pixels = np.sum(cloud_pixels)
+        coverage = (cloudy_pixels / total_pixels) * 100
+        
+        return float(coverage)
+    
+    except Exception as e:
+        print(f"Error calculating cloud coverage: {e}")
+        return 0.0
 
 def load_and_preprocess_image(image_path):
     """Loads and preprocesses a single image. Output is HWC (Height, Width, Channels)."""
@@ -343,137 +401,463 @@ class ResidualCNNLSTMModel(nn.Module):
         out = self.fc2(out)
         return out
 
-def train_and_evaluate(model, X_train_np, y_train_np, X_test_np, y_test_np, model_name, future_interval, scaler_y):
-    """Trains the PyTorch model and evaluates it."""
-    print(f"--- Training {model_name} for {future_interval*15}-minute prediction (PyTorch) ---")
+class ImprovedCNNFeatureExtractor(nn.Module):
+    """Improved CNN feature extractor with residual connections and batch normalization."""
+    def __init__(self, config: CloudCoverageConfig):
+        super().__init__()
+        self.config = config
+        
+        def conv_block(in_channels, out_channels, stride=1):
+            return nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(p=config.dropout_rate)
+            )
+        
+        # Initial convolution
+        self.conv1 = conv_block(1, config.cnn_channels[0])
+        
+        # Residual blocks
+        self.res_blocks = nn.ModuleList([
+            nn.Sequential(
+                conv_block(channels, channels),
+                conv_block(channels, channels)
+            ) for channels in config.cnn_channels
+        ])
+        
+        # Transition blocks (downsampling)
+        self.transitions = nn.ModuleList([
+            conv_block(config.cnn_channels[i], config.cnn_channels[i+1], stride=2)
+            for i in range(len(config.cnn_channels)-1)
+        ])
+        
+        # Calculate output size
+        self._calculate_output_size()
     
+    def _calculate_output_size(self):
+        """Calculate the output size of the CNN."""
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 1, self.config.img_height, self.config.img_width)
+            output = self.forward(dummy_input)
+            self._output_size = output.view(1, -1).shape[1]
+    
+    @property
+    def output_size(self):
+        return self._output_size
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        
+        for res_block, transition in zip(self.res_blocks[:-1], self.transitions):
+            identity = x
+            x = res_block(x)
+            x = x + identity  # Residual connection
+            x = transition(x)
+        
+        # Last residual block without transition
+        identity = x
+        x = self.res_blocks[-1](x)
+        x = x + identity
+        
+        return x.flatten(start_dim=1)  # Flatten for the LSTM
+
+class ImprovedLSTMModel(nn.Module):
+    """Improved LSTM model with attention mechanism and skip connections."""
+    def __init__(self, config: CloudCoverageConfig):
+        super().__init__()
+        self.config = config
+        self.cnn = ImprovedCNNFeatureExtractor(config)
+        cnn_output_size = self.cnn.output_size
+        
+        # Bidirectional LSTM layers
+        self.lstm_layers = nn.ModuleList([
+            nn.LSTM(
+                input_size=cnn_output_size if i == 0 else config.lstm_hidden_size * 2,
+                hidden_size=config.lstm_hidden_size,
+                bidirectional=True,
+                batch_first=True
+            ) for i in range(2)  # 2-layer LSTM
+        ])
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(config.lstm_hidden_size * 2, config.lstm_hidden_size),
+            nn.Tanh(),
+            nn.Linear(config.lstm_hidden_size, 1)
+        )
+        
+        # Output layers
+        self.fc1 = nn.Linear(config.lstm_hidden_size * 2, config.lstm_hidden_size)
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.fc2 = nn.Linear(config.lstm_hidden_size, 1)
+        
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize model weights."""
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                if 'lstm' in name:
+                    nn.init.orthogonal_(param)
+                else:
+                    nn.init.kaiming_normal_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0)
+    
+    def attention_forward(self, lstm_output):
+        """Apply attention mechanism to LSTM output."""
+        attention_weights = self.attention(lstm_output)
+        attention_weights = torch.softmax(attention_weights, dim=1)
+        attended_out = torch.sum(attention_weights * lstm_output, dim=1)
+        return attended_out, attention_weights
+    
+    def forward(self, x):
+        batch_size, timesteps, H, W, C = x.size()
+        
+        # Process each timestep through CNN
+        x = x.view(batch_size * timesteps, C, H, W)
+        x = self.cnn(x)
+        x = x.view(batch_size, timesteps, -1)
+        
+        # Process through LSTM layers with skip connections
+        lstm_out = x
+        all_states = []
+        for lstm_layer in self.lstm_layers:
+            new_states, _ = lstm_layer(lstm_out)
+            if len(all_states) > 0:  # Add skip connection
+                lstm_out = new_states + all_states[-1]
+            else:
+                lstm_out = new_states
+            all_states.append(lstm_out)
+        
+        # Apply attention
+        context, attention_weights = self.attention_forward(lstm_out)
+        
+        # Final prediction
+        out = self.fc1(context)
+        out = F.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        
+        return out
+
+class ImprovedTransformerModel(nn.Module):
+    """Improved Transformer model with advanced features."""
+    def __init__(self, config: CloudCoverageConfig):
+        super().__init__()
+        self.config = config
+        self.cnn = ImprovedCNNFeatureExtractor(config)
+        cnn_output_size = self.cnn.output_size
+        
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(
+            d_model=config.lstm_hidden_size,
+            max_len=config.n_past_timesteps
+        )
+        
+        # Input projection
+        self.input_projection = nn.Linear(cnn_output_size, config.lstm_hidden_size)
+        
+        # Transformer layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.lstm_hidden_size,
+            nhead=8,
+            dim_feedforward=config.lstm_hidden_size * 4,
+            dropout=config.dropout_rate,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=4)
+        
+        # Output layers
+        self.fc1 = nn.Linear(config.lstm_hidden_size, config.lstm_hidden_size // 2)
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.fc2 = nn.Linear(config.lstm_hidden_size // 2, 1)
+    
+    def forward(self, x):
+        batch_size, timesteps, H, W, C = x.size()
+        
+        # Process through CNN
+        x = x.view(batch_size * timesteps, C, H, W)
+        x = self.cnn(x)
+        x = x.view(batch_size, timesteps, -1)
+        
+        # Project to transformer dimension
+        x = self.input_projection(x)
+        
+        # Add positional encoding
+        x = self.pos_encoder(x)
+        
+        # Transform
+        transformer_out = self.transformer_encoder(x)
+        
+        # Use the final timestep for prediction
+        out = transformer_out[:, -1, :]
+        
+        # Final prediction
+        out = self.fc1(out)
+        out = F.relu(out)
+        out = self.dropout(out)
+        out = self.fc2(out)
+        
+        return out
+
+class PositionalEncoding(nn.Module):
+    """Positional encoding for transformer model."""
+    def __init__(self, d_model: int, max_len: int = 5000):
+        super().__init__()
+        position = torch.arange(max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Tensor, shape [batch_size, seq_len, embedding_dim]
+        """
+        x = x + self.pe[:x.size(1)]
+        return x
+
+# --- Training and Evaluation Functions ---
+
+def train_and_evaluate(model, X_data, y_data, model_name, future_interval, scaler_y):
+    """Trains the PyTorch model with proper validation and comprehensive metrics."""
+    print(f"--- Training {model_name} for {future_interval*15}-minute prediction (PyTorch) ---")
+    start_time = datetime.now()
+    
+    # Split data into train, validation, and test sets
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data(X_data, y_data)
+    
+    # Move model to device and setup training
     model.to(DEVICE)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
-
-    # Convert numpy arrays to PyTorch tensors
-    # X shape: (num_samples, n_past, H, W, C)
-    X_train = torch.from_numpy(X_train_np).float().to(DEVICE)
-    y_train = torch.from_numpy(y_train_np).float().to(DEVICE)
-    X_test = torch.from_numpy(X_test_np).float().to(DEVICE)
-    y_test = torch.from_numpy(y_test_np).float().to(DEVICE)
-
-    train_dataset = TensorDataset(X_train, y_train)
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-    test_dataset = TensorDataset(X_test, y_test) # For final evaluation
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-
-    model_path = os.path.join(MODEL_SAVE_PATH, f'{model_name}_future_{future_interval*15}min.pth') # PyTorch extension
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=LR_PATIENCE, verbose=True)
     
+    # Create dataloaders
+    train_loader = DataLoader(TensorDataset(torch.from_numpy(X_train).float(), torch.from_numpy(y_train).float()),
+                            batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(TensorDataset(torch.from_numpy(X_val).float(), torch.from_numpy(y_val).float()),
+                          batch_size=BATCH_SIZE)
+    test_loader = DataLoader(TensorDataset(torch.from_numpy(X_test).float(), torch.from_numpy(y_test).float()),
+                           batch_size=BATCH_SIZE)
+    
+    # Training history
     best_val_loss = float('inf')
-    epochs_no_improve = 0
-    patience = 10 # Early stopping patience
-
+    early_stop_counter = 0
     train_losses = []
-    val_losses = [] # Using test set as validation for simplicity here
-
+    val_losses = []
+    train_r2_scores = []
+    val_r2_scores = []
+    
+    model_path = os.path.join(MODEL_SAVE_PATH, f'{model_name}_future_{future_interval*15}min.pth')
+    
+    print("Starting training...")
     for epoch in range(EPOCHS):
+        # Training phase
         model.train()
         epoch_train_loss = 0
+        train_preds = []
+        train_targets = []
+        
         for batch_X, batch_y in train_loader:
+            batch_X, batch_y = batch_X.to(DEVICE), batch_y.to(DEVICE)
+            
             optimizer.zero_grad()
             outputs = model(batch_X)
             loss = criterion(outputs, batch_y)
             loss.backward()
             optimizer.step()
+            
             epoch_train_loss += loss.item() * batch_X.size(0)
+            train_preds.extend(outputs.detach().cpu().numpy())
+            train_targets.extend(batch_y.cpu().numpy())
         
-        epoch_train_loss /= len(train_loader.dataset)
-        train_losses.append(epoch_train_loss)
-
-        # Validation phase (using test set for simplicity)
-        model.eval()
-        epoch_val_loss = 0
-        with torch.no_grad():
-            for batch_X_val, batch_y_val in test_loader: # Using test_loader for validation loss
-                outputs_val = model(batch_X_val)
-                loss_val = criterion(outputs_val, batch_y_val)
-                epoch_val_loss += loss_val.item() * batch_X_val.size(0)
+        # Evaluation phase
+        train_metrics = evaluate_model(model, train_loader, criterion, DEVICE, scaler_y)
+        val_metrics = evaluate_model(model, val_loader, criterion, DEVICE, scaler_y)
         
-        epoch_val_loss /= len(test_loader.dataset)
-        val_losses.append(epoch_val_loss)
-
-        print(f"Epoch {epoch+1}/{EPOCHS}, Train Loss: {epoch_train_loss:.6f}, Val Loss: {epoch_val_loss:.6f}")
-
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            torch.save(model.state_dict(), model_path)
-            epochs_no_improve = 0
-            print(f"Validation loss improved. Saved model to {model_path}")
+        # Update learning rate
+        scheduler.step(val_metrics['loss'])
+        
+        # Save metrics
+        train_losses.append(train_metrics['loss'])
+        val_losses.append(val_metrics['loss'])
+        train_r2_scores.append(train_metrics['r2'])
+        val_r2_scores.append(val_metrics['r2'])
+        
+        # Print progress
+        print(f"Epoch [{epoch+1}/{EPOCHS}]")
+        print(f"Train Loss: {train_metrics['loss']:.4f}, Train R²: {train_metrics['r2']:.4f}")
+        print(f"Val Loss: {val_metrics['loss']:.4f}, Val R²: {val_metrics['r2']:.4f}")
+        
+        # Model checkpoint
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
+            early_stop_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'val_loss': val_metrics['loss'],
+                'val_r2': val_metrics['r2']
+            }, model_path)
+            print("Saved new best model!")
         else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                print(f"Early stopping triggered after {epoch+1} epochs.")
+            early_stop_counter += 1
+            if early_stop_counter >= EARLY_STOPPING_PATIENCE:
+                print("Early stopping triggered!")
                 break
     
-    # Load the best model
-    model.load_state_dict(torch.load(model_path))
+    # Plot learning curves
+    plot_learning_curves(train_losses, val_losses, train_r2_scores, val_r2_scores, model_name, future_interval)
+    
+    # Load best model for final evaluation
+    checkpoint = torch.load(model_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
-    all_predictions_scaled = []
-    all_y_test_scaled = []
-    with torch.no_grad():
-        for batch_X_test, batch_y_test in test_loader:
-            predictions_scaled = model(batch_X_test)
-            all_predictions_scaled.append(predictions_scaled.cpu().numpy())
-            all_y_test_scaled.append(batch_y_test.cpu().numpy())
+    # Final evaluation on test set
+    test_metrics = evaluate_model(model, test_loader, criterion, DEVICE, scaler_y)
+    
+    # Create prediction vs actual plots
+    plot_prediction_comparison(test_metrics['targets'], test_metrics['predictions'], 
+                             model_name, future_interval)
+    
+    # Save final metrics
+    training_duration = (datetime.now() - start_time).total_seconds() / 3600
+    final_metrics = {
+        'model_name': model_name,
+        'prediction_horizon': f"{future_interval*15} minutes",
+        'performance_metrics': {
+            'test_loss': float(test_metrics['loss']),
+            'test_r2': float(test_metrics['r2']),
+            'test_rmse': float(test_metrics['rmse']),
+            'test_mae': float(test_metrics['mae'])
+        },
+        'training_info': {
+            'duration_hours': float(training_duration),
+            'epochs_completed': epoch + 1,
+            'early_stopped': early_stop_counter >= EARLY_STOPPING_PATIENCE,
+            'final_learning_rate': float(optimizer.param_groups[0]['lr']),
+            'best_validation_loss': float(best_val_loss)
+        },
+        'dataset_info': {
+            'train_samples': len(train_loader.dataset),
+            'validation_samples': len(val_loader.dataset),
+            'test_samples': len(test_loader.dataset)
+        },
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    }
+    
+    save_model_metrics(final_metrics, model_name, future_interval)
+    
+    print("\nFinal Test Results:")
+    print(f"Loss: {test_metrics['loss']:.4f}")
+    print(f"R² Score: {test_metrics['r2']:.4f}")
+    print(f"RMSE: {test_metrics['rmse']:.4f}")
+    print(f"MAE: {test_metrics['mae']:.4f}")
+    print(f"Training Duration: {training_duration:.2f} hours")
+    
+    return final_metrics
 
-    all_predictions_scaled = np.concatenate(all_predictions_scaled, axis=0)
-    all_y_test_scaled = np.concatenate(all_y_test_scaled, axis=0)
+def plot_training_history(history, model_name, future_interval):
+    """
+    Plots training history including loss curves and metrics.
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    plt.figure(figsize=(15, 5))
+    
+    # Plot loss curves
+    plt.subplot(1, 2, 1)
+    plt.plot(history['train_loss'], label='Training Loss')
+    plt.plot(history['val_loss'], label='Validation Loss')
+    plt.title(f'Loss Curves - {model_name} ({future_interval*15}min)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot metrics
+    plt.subplot(1, 2, 2)
+    plt.plot(history['train_r2'], label='Training R²')
+    plt.plot(history['val_r2'], label='Validation R²')
+    plt.title(f'R² Score - {model_name} ({future_interval*15}min)')
+    plt.xlabel('Epoch')
+    plt.ylabel('R² Score')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(PLOTS_PATH, f'training_history_{model_name}_{future_interval*15}min_{timestamp}.png')
+    plt.savefig(plot_path)
+    plt.close()
 
-    # Inverse transform to get actual values for R2 score and plotting
-    predictions_actual = scaler_y.inverse_transform(all_predictions_scaled)
-    y_test_actual = scaler_y.inverse_transform(all_y_test_scaled)
+def plot_prediction_comparison(y_true, y_pred, model_name, future_interval):
+    """
+    Creates scatter and residual plots for model predictions.
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    plt.figure(figsize=(15, 5))
+    
+    # Scatter plot
+    plt.subplot(1, 2, 1)
+    plt.scatter(y_true, y_pred, alpha=0.5)
+    plt.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--')
+    plt.title(f'Predicted vs Actual - {model_name} ({future_interval*15}min)')
+    plt.xlabel('Actual Cloud Coverage (%)')
+    plt.ylabel('Predicted Cloud Coverage (%)')
+    plt.grid(True)
+    
+    # Residual plot
+    residuals = y_pred - y_true
+    plt.subplot(1, 2, 2)
+    plt.scatter(y_pred, residuals, alpha=0.5)
+    plt.axhline(y=0, color='r', linestyle='--')
+    plt.title('Residual Plot')
+    plt.xlabel('Predicted Cloud Coverage (%)')
+    plt.ylabel('Residuals')
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plot_path = os.path.join(PLOTS_PATH, f'prediction_comparison_{model_name}_{future_interval*15}min_{timestamp}.png')
+    plt.savefig(plot_path)
+    plt.close()
 
-    r2 = r2_score(y_test_actual, predictions_actual)
-    print(f"R2 Score for {model_name} ({future_interval*15}-min): {r2:.4f}")
+def save_model_metrics(metrics, model_name, future_interval):
+    """
+    Saves model metrics to a JSON file.
+    """
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    metrics_file = os.path.join(METRICS_PATH, f'metrics_{model_name}_{future_interval*15}min_{timestamp}.json')
+    
+    with open(metrics_file, 'w') as f:
+        json.dump(metrics, f, indent=4)
 
-    # --- Display a sample validation image and its prediction ---
-    if X_test_np.shape[0] > 0:
-        random_idx = np.random.randint(0, X_test_np.shape[0])
-        sample_X = X_test_np[random_idx] # Shape: (n_past, H, W, C)
-        sample_y_scaled = y_test_np[random_idx] # Shape: (1,) or scalar
-
-        # Prepare sample for model
-        # X_test_np stores images as (n_past, H, W, C), model expects (batch, n_past, H, W, C)
-        sample_X_tensor = torch.from_numpy(sample_X).float().unsqueeze(0).to(DEVICE)
-
-        model.eval() # Ensure model is in eval mode
-        with torch.no_grad():
-            prediction_scaled = model(sample_X_tensor) # Shape: (1, 1)
-
-        # Inverse transform
-        # prediction_scaled is (1,1), inverse_transform expects (n_samples, n_features)
-        prediction_actual = scaler_y.inverse_transform(prediction_scaled.cpu().numpy())[0,0]
-        # sample_y_scaled is (1,), inverse_transform expects (n_samples, n_features)
-        actual_y_actual = scaler_y.inverse_transform(sample_y_scaled.reshape(1, -1))[0,0]
-
-        # Display the last image of the input sequence
-        # sample_X has shape (n_past, H, W, C), last image is sample_X[-1]
-        # Assuming C=1 (grayscale), so sample_X[-1, :, :, 0] gives (H,W)
-        last_image_in_sequence = sample_X[-1, :, :, 0]
-
-        plt.figure(figsize=(6,6))
-        plt.imshow(last_image_in_sequence, cmap='gray')
-        title_text = (f"Sample Validation Image ({model_name} - {future_interval*15}min)\\n"
-                      f"Actual Coverage: {actual_y_actual:.2f}%\\n"
-                      f"Predicted Coverage: {prediction_actual:.2f}%")
-        plt.title(title_text)
-        plt.axis('off')
-        sample_img_save_path = os.path.join(RESULTS_PATH, f'{model_name}_future_{future_interval*15}min_sample_validation.png')
-        plt.savefig(sample_img_save_path)
-        plt.close()
-        print(f"Saved sample validation image to: {sample_img_save_path}")
-        print(f"Sample - Actual: {actual_y_actual:.2f}%, Predicted: {prediction_actual:.2f}% for {model_name} ({future_interval*15}-min)")
-
-    return r2
+def split_data(X, y):
+    """
+    Splits data into train, validation, and test sets using the configured ratios.
+    """
+    # First split: separate test set
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, 
+        test_size=TRAIN_VAL_TEST_SPLIT[2],
+        random_state=42
+    )
+    
+    # Second split: separate validation set from temporary set
+    val_size = TRAIN_VAL_TEST_SPLIT[1] / (TRAIN_VAL_TEST_SPLIT[0] + TRAIN_VAL_TEST_SPLIT[1])
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp,
+        test_size=val_size,
+        random_state=42
+    )
+    
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
 # --- Main Script ---
 if __name__ == "__main__":
@@ -658,7 +1042,19 @@ if __name__ == "__main__":
             "LSTM_PyTorch": lambda: LSTMModel(cnn_output_size=cnn_output_size, n_future=1),
             "GRU_PyTorch": lambda: GRUModel(cnn_output_size=cnn_output_size, n_future=1),
             "ResidualCNN_LSTM_PyTorch": lambda: ResidualCNNLSTMModel(cnn_output_size=cnn_output_size, n_future=1),
-            "Transformer_PyTorch": lambda: TransformerModel(cnn_output_size=cnn_output_size, n_future=1)
+            "Transformer_PyTorch": lambda: TransformerModel(cnn_output_size=cnn_output_size, n_future=1),
+            "ImprovedLSTM_PyTorch": lambda: ImprovedLSTMModel(config=CloudCoverageConfig(
+                img_height=IMG_HEIGHT, img_width=IMG_WIDTH, n_past_timesteps=N_PAST_TIMESTEPS, n_future_timesteps=N_FUTURE_TIMESTEPS,
+                lstm_hidden_size=128, dropout_rate=0.2, cnn_channels=[32, 64, 128], epochs=EPOCHS, batch_size=BATCH_SIZE,
+                learning_rate=LEARNING_RATE, early_stopping_patience=EARLY_STOPPING_PATIENCE, lr_patience=LR_PATIENCE,
+                train_val_test_split=TRAIN_VAL_TEST_SPLIT
+            )),
+            "ImprovedTransformer_PyTorch": lambda: ImprovedTransformerModel(config=CloudCoverageConfig(
+                img_height=IMG_HEIGHT, img_width=IMG_WIDTH, n_past_timesteps=N_PAST_TIMESTEPS, n_future_timesteps=N_FUTURE_TIMESTEPS,
+                lstm_hidden_size=128, dropout_rate=0.2, cnn_channels=[32, 64, 128], epochs=EPOCHS, batch_size=BATCH_SIZE,
+                learning_rate=LEARNING_RATE, early_stopping_patience=EARLY_STOPPING_PATIENCE, lr_patience=LR_PATIENCE,
+                train_val_test_split=TRAIN_VAL_TEST_SPLIT
+            ))
         }
 
         for model_name, builder_func in model_builders.items():
@@ -679,4 +1075,386 @@ if __name__ == "__main__":
     print(f"\nPyTorch Models saved in: {MODEL_SAVE_PATH}")
     print(f"PyTorch Results (plots, summary) saved in: {RESULTS_PATH}")
     print("PyTorch Script finished.")
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('cloud_coverage.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Suppress specific warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torch.nn.functional')
+
+class CloudCoverageConfig:
+    """Configuration class for cloud coverage prediction model."""
+    def __init__(self, **kwargs):
+        # Data configuration
+        self.data_path = kwargs.get('data_path', 'data/')
+        self.metadata_file = kwargs.get('metadata_file', 'image_metadata.csv')
+        self.img_height = kwargs.get('img_height', 128)
+        self.img_width = kwargs.get('img_width', 128)
+        
+        # Model configuration
+        self.model_type = kwargs.get('model_type', 'LSTM')
+        self.n_past_timesteps = kwargs.get('n_past_timesteps', 16)
+        self.n_future_timesteps = kwargs.get('n_future_timesteps', [1, 2, 3])
+        self.cnn_channels = kwargs.get('cnn_channels', [32, 64, 128])
+        self.lstm_hidden_size = kwargs.get('lstm_hidden_size', 128)
+        self.dropout_rate = kwargs.get('dropout_rate', 0.2)
+        
+        # Training configuration
+        self.batch_size = kwargs.get('batch_size', 64)
+        self.epochs = kwargs.get('epochs', 100)
+        self.learning_rate = kwargs.get('learning_rate', 0.001)
+        self.early_stopping_patience = kwargs.get('early_stopping_patience', 15)
+        self.lr_patience = kwargs.get('lr_patience', 5)
+        self.train_val_test_split = kwargs.get('train_val_test_split', [0.7, 0.15, 0.15])
+        
+        # Augmentation configuration
+        self.use_augmentation = kwargs.get('use_augmentation', True)
+        self.augmentation_prob = kwargs.get('augmentation_prob', 0.5)
+        
+        # Paths configuration
+        self.model_save_path = kwargs.get('model_save_path', 'models_pytorch/')
+        self.results_path = kwargs.get('results_path', 'results_pytorch/')
+        self.plots_path = Path(self.results_path) / 'plots'
+        self.metrics_path = Path(self.results_path) / 'metrics'
+        
+        # Create necessary directories
+        for path in [self.model_save_path, self.results_path, self.plots_path, self.metrics_path]:
+            Path(path).mkdir(parents=True, exist_ok=True)
+        
+        # Validate configuration
+        self._validate_config()
+    
+    def _validate_config(self):
+        """Validate configuration parameters."""
+        assert sum(self.train_val_test_split) == 1.0, "Split ratios must sum to 1.0"
+        assert all(x > 0 for x in self.train_val_test_split), "Split ratios must be positive"
+        assert self.batch_size > 0, "Batch size must be positive"
+        assert self.epochs > 0, "Number of epochs must be positive"
+        assert self.learning_rate > 0, "Learning rate must be positive"
+        assert len(self.n_future_timesteps) > 0, "Must predict at least one future timestep"
+    
+    def save(self, path: str):
+        """Save configuration to JSON file."""
+        with open(path, 'w') as f:
+            json.dump(self.__dict__, f, indent=4)
+    
+    @classmethod
+    def load(cls, path: str) -> 'CloudCoverageConfig':
+        """Load configuration from JSON file."""
+        with open(path, 'r') as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)
+
+class ImageAugmentor:
+    """Handles image augmentation for cloud coverage prediction."""
+    def __init__(self, config: CloudCoverageConfig):
+        self.config = config
+        self.transform = A.Compose([
+            A.RandomBrightnessContrast(p=config.augmentation_prob),
+            A.GaussNoise(p=config.augmentation_prob),
+            A.GaussianBlur(p=config.augmentation_prob),
+            A.GridDistortion(p=config.augmentation_prob/2),
+            A.RandomRotate90(p=config.augmentation_prob),
+            A.HorizontalFlip(p=config.augmentation_prob),
+            A.VerticalFlip(p=config.augmentation_prob)
+        ])
+    
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        """Apply augmentation to image."""
+        if not self.config.use_augmentation:
+            return image
+        
+        # Ensure correct input format for albumentations
+        if len(image.shape) == 3 and image.shape[-1] == 1:
+            image = image.squeeze(-1)
+        
+        # Apply transformation
+        augmented = self.transform(image=image)
+        result = augmented['image']
+        
+        # Restore channel dimension if needed
+        if len(result.shape) == 2:
+            result = np.expand_dims(result, axis=-1)
+        
+        return result.astype(np.float32)
+
+class MetricsTracker:
+    """Tracks and logs model metrics during training."""
+    def __init__(self, config: CloudCoverageConfig, model_name: str):
+        self.config = config
+        self.model_name = model_name
+        self.writer = SummaryWriter(log_dir=f'runs/{model_name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}')
+        self.metrics_history = defaultdict(list)
+        
+        # Initialize wandb if available
+        try:
+            wandb.init(project="cloud_coverage_prediction", name=model_name)
+            self.use_wandb = True
+        except Exception as e:
+            logger.warning(f"Could not initialize wandb: {e}")
+            self.use_wandb = False
+    
+    def update(self, metrics: Dict[str, float], step: int, phase: str = 'train'):
+        """Update metrics for given step and phase."""
+        # Log to tensorboard
+        for name, value in metrics.items():
+            self.writer.add_scalar(f'{phase}/{name}', value, step)
+            self.metrics_history[f'{phase}_{name}'].append(value)
+        
+        # Log to wandb
+        if self.use_wandb:
+            wandb.log({f'{phase}_{k}': v for k, v in metrics.items()}, step=step)
+    
+    def plot_metrics(self):
+        """Plot training metrics."""
+        metrics_plot_path = self.config.plots_path / f'{self.model_name}_metrics.png'
+        plt.figure(figsize=(15, 10))
+        
+        # Plot each metric
+        num_metrics = len(self.metrics_history) // 2  # Divide by 2 for train/val
+        for idx, (name, values) in enumerate(self.metrics_history.items()):
+            if 'train' in name:
+                plt.subplot(num_metrics, 1, idx//2 + 1)
+                plt.plot(values, label=f'Train {name.split("_")[-1]}')
+                plt.plot(self.metrics_history[name.replace('train', 'val')], 
+                        label=f'Val {name.split("_")[-1]}')
+                plt.title(name.split("_")[-1])
+                plt.legend()
+                plt.grid(True)
+        
+        plt.tight_layout()
+        plt.savefig(metrics_plot_path)
+        plt.close()
+    
+    def save_metrics(self):
+        """Save metrics to JSON file."""
+        metrics_file = self.config.metrics_path / f'{self.model_name}_metrics.json'
+        with open(metrics_file, 'w') as f:
+            json.dump(self.metrics_history, f, indent=4)
+    
+    def print_current_metrics(self, epoch: int, phase: str = 'train'):
+        """Print current metrics in a formatted table."""
+        table = PrettyTable()
+        table.field_names = ["Metric", "Value"]
+        
+        for name, values in self.metrics_history.items():
+            if phase in name and values:  # Check if we have values
+                table.add_row([name.split('_')[-1], f"{values[-1]:.4f}"])
+        
+        print(f"\nEpoch {epoch} - {phase.capitalize()} Metrics:")
+        print(table)
+    
+    def close(self):
+        """Cleanup resources."""
+        self.writer.close()
+        if self.use_wandb:
+            wandb.finish()
+
+def train_epoch(
+    model: nn.Module,
+    train_loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    config: CloudCoverageConfig,
+    device: torch.device,
+    scaler_y: Optional[MinMaxScaler] = None
+) -> Dict[str, float]:
+    """Train model for one epoch."""
+    model.train()
+    total_loss = 0
+    all_targets = []
+    all_predictions = []
+    
+    with tqdm(train_loader, desc="Training") as pbar:
+        for batch_X, batch_y in pbar:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+            
+            optimizer.zero_grad()
+            
+            # Forward pass (handle both attention and non-attention models)
+            if isinstance(model, ImprovedLSTMModel):
+                predictions, _ = model(batch_X)
+            else:
+                predictions = model(batch_X)
+            
+            # Calculate loss
+            loss = criterion(predictions, batch_y)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            # Update metrics
+            total_loss += loss.item() * batch_X.size(0)
+            
+            # Store predictions and targets for metrics
+            if scaler_y:
+                predictions = scaler_y.inverse_transform(predictions.detach().cpu().numpy())
+                batch_y = scaler_y.inverse_transform(batch_y.cpu().numpy())
+            else:
+                predictions = predictions.detach().cpu().numpy()
+                batch_y = batch_y.cpu().numpy()
+            
+            all_predictions.extend(predictions)
+            all_targets.extend(batch_y)
+            
+            # Update progress bar
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+    
+    # Calculate metrics
+    all_predictions = np.array(all_predictions)
+    all_targets = np.array(all_targets)
+    avg_loss = total_loss / len(train_loader.dataset)
+    r2 = r2_score(all_targets, all_predictions)
+    rmse = np.sqrt(mean_squared_error(all_targets, all_predictions))
+    mae = mean_absolute_error(all_targets, all_predictions)
+    
+    return {
+        'loss': avg_loss,
+        'r2': r2,
+        'rmse': rmse,
+        'mae': mae,
+        'predictions': all_predictions,
+        'targets': all_targets
+    }
+
+def validate(
+    model: nn.Module,
+    val_loader: DataLoader,
+    criterion: nn.Module,
+    config: CloudCoverageConfig,
+    device: torch.device,
+    scaler_y: Optional[MinMaxScaler] = None
+) -> Dict[str, float]:
+    """Validate the model."""
+    model.eval()
+    total_loss = 0
+    all_targets = []
+    all_predictions = []
+    all_attention_weights = []
+    
+    with torch.no_grad():
+        with tqdm(val_loader, desc="Validation") as pbar:
+            for batch_X, batch_y in pbar:
+                batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+                
+                # Forward pass
+                if isinstance(model, ImprovedLSTMModel):
+                    predictions, attention_weights = model(batch_X)
+                    all_attention_weights.append(attention_weights.cpu().numpy())
+                else:
+                    predictions = model(batch_X)
+                
+                # Calculate loss
+                loss = criterion(predictions, batch_y)
+                total_loss += loss.item() * batch_X.size(0)
+                
+                # Store predictions and targets
+                if scaler_y:
+                    predictions = scaler_y.inverse_transform(predictions.cpu().numpy())
+                    batch_y = scaler_y.inverse_transform(batch_y.cpu().numpy())
+                else:
+                    predictions = predictions.cpu().numpy()
+                    batch_y = batch_y.cpu().numpy()
+                
+                all_predictions.extend(predictions)
+                all_targets.extend(batch_y)
+                
+                pbar.set_postfix({'val_loss': f'{loss.item():.4f}'})
+    
+    # Calculate metrics
+    all_predictions = np.array(all_predictions)
+    all_targets = np.array(all_targets)
+    avg_loss = total_loss / len(val_loader.dataset)
+    r2 = r2_score(all_targets, all_predictions)
+    rmse = np.sqrt(mean_squared_error(all_targets, all_predictions))
+    mae = mean_absolute_error(all_targets, all_predictions)
+    
+    results = {
+        'loss': avg_loss,
+        'r2': r2,
+        'rmse': rmse,
+        'mae': mae,
+        'predictions': all_predictions,
+        'targets': all_targets
+    }
+    
+    if all_attention_weights:
+        results['attention_weights'] = np.concatenate(all_attention_weights, axis=0)
+    
+    return results
+
+def save_model_checkpoint(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    epoch: int,
+    metrics: Dict[str, float],
+    config: CloudCoverageConfig,
+    model_name: str
+) -> str:
+    """Save model checkpoint."""
+    checkpoint_path = Path(config.model_save_path) / f'{model_name}_checkpoint.pt'
+    
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'metrics': metrics,
+        'config': config.__dict__
+    }
+    
+    torch.save(checkpoint, checkpoint_path)
+    logger.info(f"Saved checkpoint to {checkpoint_path}")
+    return str(checkpoint_path)
+
+def load_model_checkpoint(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    scheduler: Any,
+    checkpoint_path: str
+) -> Tuple[nn.Module, optim.Optimizer, Any, int, Dict[str, float]]:
+    """Load model checkpoint."""
+    checkpoint = torch.load(checkpoint_path)
+    
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler and checkpoint['scheduler_state_dict']:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    return model, optimizer, scheduler, checkpoint['epoch'], checkpoint['metrics']
+
+def plot_attention_weights(
+    attention_weights: np.ndarray,
+    config: CloudCoverageConfig,
+    model_name: str,
+    sample_idx: int = 0
+):
+    """Plot attention weights for visualization."""
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(
+        attention_weights[sample_idx].squeeze(),
+        cmap='viridis',
+        xticklabels=range(1, config.n_past_timesteps + 1),
+        yticklabels=['Attention']
+    )
+    plt.title(f'Attention Weights - {model_name}')
+    plt.xlabel('Time Step')
+    
+    plot_path = config.plots_path / f'{model_name}_attention.png'
+    plt.savefig(plot_path)
+    plt.close()
 

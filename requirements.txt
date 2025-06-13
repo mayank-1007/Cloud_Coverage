@@ -6,4 +6,9 @@ pandas>=1.3.0
 opencv-python>=4.5.0
 matplotlib>=3.5.0
 rasterio>=1.2.0
-# Add any other specific versions or libraries you need
+seaborn>=0.11.0
+tqdm>=4.65.0
+tensorboard>=2.12.0
+wandb>=0.15.0
+albumentations>=1.3.0  # For advanced image augmentation
+prettytable>=3.7.0  # For better console output formatting
